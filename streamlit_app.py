@@ -1,16 +1,76 @@
 import streamlit as st
 import pandas as pd
+import requests
+from requests_ntlm import HttpNtlmAuth
+
+try:
+    from requests_negotiate_sspi import HttpNegotiateAuth
+    HAS_SSPI = True
+except ImportError:
+    HAS_SSPI = False
+
+SITE_URL = "http://intranet/sites/rbpt-qrs"
+LIST_TITLE = "Concession Request System"
 
 st.title("Concession Dashboard")
 
-uploaded_file = st.file_uploader(
-    "Upload Concession Excel File",
-    type=["xlsx"]
+
+def get_sharepoint_credentials():
+    if HAS_SSPI:
+        return None
+
+    st.sidebar.subheader("SharePoint credentials")
+    username = st.sidebar.text_input("Domain\\Username")
+    password = st.sidebar.text_input("Password", type="password")
+    return (username, password)
+
+
+@st.cache_data(ttl=300, show_spinner="Pulling concession data from SharePoint...")
+def fetch_concession_data(credentials):
+    auth = HttpNegotiateAuth() if credentials is None else HttpNtlmAuth(*credentials)
+    headers = {"Accept": "application/json;odata=nometadata"}
+
+    url = (
+        f"{SITE_URL}/_api/web/lists/getbytitle('{LIST_TITLE}')/items"
+        "?$select=FieldValuesAsText/*&$expand=FieldValuesAsText&$top=2000"
+    )
+
+    rows = []
+    while url:
+        response = requests.get(url, auth=auth, headers=headers, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        rows.extend(item["FieldValuesAsText"] for item in payload["value"])
+        url = payload.get("odata.nextLink") or payload.get("@odata.nextLink")
+
+    return pd.DataFrame(rows)
+
+
+source = st.radio(
+    "Data source",
+    ["Pull from Concession System", "Upload Excel File"],
+    horizontal=True
 )
 
-if uploaded_file:
+df = None
 
-    df = pd.read_excel(uploaded_file)
+if source == "Pull from Concession System":
+    credentials = get_sharepoint_credentials()
+    if st.button("Load / Refresh data"):
+        fetch_concession_data.clear()
+    try:
+        df = fetch_concession_data(credentials)
+    except requests.exceptions.RequestException as e:
+        st.error(f"Could not reach the Concession System: {e}")
+else:
+    uploaded_file = st.file_uploader(
+        "Upload Concession Excel File",
+        type=["xlsx"]
+    )
+    if uploaded_file:
+        df = pd.read_excel(uploaded_file)
+
+if df is not None:
 
     # Find disposition column
     disposition_col = "Disposition Decision"
@@ -27,7 +87,7 @@ if uploaded_file:
             placeholder="e.g. RBPT01-MK-00741"
         )
 
-    dates = pd.to_datetime(df[date_col], errors="coerce").dt.date.dropna()
+    dates = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce").dt.date.dropna()
 
     with filter_col2:
         if not dates.empty:
@@ -53,7 +113,7 @@ if uploaded_file:
         ]
 
     if date_range:
-        row_dates = pd.to_datetime(filtered_df[date_col], errors="coerce").dt.date
+        row_dates = pd.to_datetime(filtered_df[date_col], dayfirst=True, errors="coerce").dt.date
         filtered_df = filtered_df[row_dates.between(date_range[0], date_range[1])]
 
     st.caption(f"Showing {len(filtered_df)} of {len(df)} records")
